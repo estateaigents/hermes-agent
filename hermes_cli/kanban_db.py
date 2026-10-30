@@ -4597,3 +4597,7 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
+from hermes_cli.kanban_birth_probe import (
+    _probe_runnable_at_birth,
+    _run_birth_probe,
+)
