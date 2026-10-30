@@ -166,6 +166,161 @@ def decompose_triage_task(
     return child_ids
 
 
+# ── CREATOR-GATED FANOUT (P12e) ────────────────────────────────────────────
+# A fan-out the CREATOR built for itself must never be gated BY that creator:
+# when the creator stalls, its own child waits on it forever. Only edges the
+# creator really made qualify — the child's ``created`` payload must name this
+# parent as ``creator_task_id`` — so a worker cannot fabricate a repair by
+# linking an arbitrary card, and an ordinary stacked successor (parent merely
+# coincidentally blocked) is left alone.
+CREATOR_GATED_FANOUT_REASON = "creator-gated fanout: stalled creator gated its own child"
+
+_CREATOR_GATED_FANOUT_SQL = """
+    SELECT l.parent_id AS creator_id, l.child_id AS child_id
+      FROM task_links l
+      JOIN tasks creator ON creator.id = l.parent_id
+      JOIN tasks child   ON child.id   = l.child_id
+      JOIN task_events e ON e.id = (
+              SELECT MIN(e2.id) FROM task_events e2
+               WHERE e2.task_id = l.child_id AND e2.kind = 'created'
+           )
+     WHERE creator.status IN ('blocked', 'triage')
+       AND child.status = 'todo'
+       AND json_valid(e.payload)
+       AND json_extract(e.payload, '$.creator_task_id') = l.parent_id
+       AND json_type(e.payload, '$.parents') = 'array'
+       AND EXISTS (
+               SELECT 1 FROM json_each(e.payload, '$.parents') p
+                WHERE p.value = l.parent_id
+           )
+       AND NOT EXISTS (
+               SELECT 1 FROM task_links o
+                WHERE o.child_id = l.child_id AND o.parent_id <> l.parent_id
+           )
+       AND (
+               -- (6a) decompose-root lineage names this child
+               EXISTS (
+                   SELECT 1 FROM task_events dz
+                    WHERE dz.task_id = l.parent_id
+                      AND dz.kind = 'decomposed'
+                      AND json_valid(dz.payload)
+                      AND json_type(dz.payload, '$.child_ids') = 'array'
+                      AND EXISTS (
+                              SELECT 1 FROM json_each(dz.payload, '$.child_ids') dzc
+                               WHERE dzc.value = l.child_id
+                          )
+               )
+               OR json_extract(e.payload, '$.from_decompose_of') = l.parent_id
+               -- (6b) the creator's LATEST stall names this child as its wait
+               OR EXISTS (
+                   SELECT 1 FROM task_events st
+                    WHERE st.id = (
+                            SELECT MAX(st2.id) FROM task_events st2
+                             WHERE st2.task_id = l.parent_id
+                               AND st2.kind IN ('blocked', 'block_loop_detected')
+                        )
+                      AND json_valid(st.payload)
+                      AND instr(
+                              lower(coalesce(json_extract(st.payload, '$.reason'), '')),
+                              lower(l.child_id)
+                          ) > 0
+                      AND (
+                              lower(coalesce(json_extract(st.payload, '$.reason'), ''))
+                                  LIKE '%unsatisfied parent%'
+                              OR json_extract(st.payload, '$.kind') = 'dependency'
+                              OR json_extract(st.payload, '$.parent') = l.child_id
+                          )
+               )
+           )
+     ORDER BY l.parent_id, l.child_id
+"""
+
+
+def repair_creator_gated_fanout(
+    conn: sqlite3.Connection, *, dry_run: bool = False,
+) -> dict[str, list]:
+    """Invert the proven stalled-creator edges; returns a report, idempotent.
+
+    ``{"violations": [(creator, child)], "removed": [...], "added": [...],
+    "skipped": [...]}`` — the inverse edge ``child -> creator`` gates the
+    creator behind the child that now runs first, which is the direction the
+    fan-out needed all along. Every repaired edge records ``unlinked`` on the
+    child (with the repair reason) and ``linked`` on the creator, then
+    ``recompute_ready`` re-gates the board so an unparented child promotes out
+    of ``todo`` at once. ``dry_run`` reports ``violations`` only and writes
+    nothing (not even the promotion pass). A residual ``creator -> … -> child``
+    path surviving the delete skips the inverse edge instead of building a
+    cycle.
+    """
+    from hermes_cli.kanban_db import (
+        _append_event, _link, _would_cycle, recompute_ready, write_txn,
+    )
+
+    violations = [
+        (row["creator_id"], row["child_id"]) for row in conn.execute(_CREATOR_GATED_FANOUT_SQL)
+    ]
+    report: dict[str, list] = {
+        "violations": list(violations), "removed": [], "added": [], "skipped": [],
+    }
+    if not violations or dry_run:
+        return report
+    with write_txn(conn):
+        for creator_id, child_id in violations:
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (creator_id, child_id),
+            )
+            report["removed"].append((creator_id, child_id))
+            _append_event(
+                conn, child_id, "unlinked",
+                {"reason": CREATOR_GATED_FANOUT_REASON, "parent": creator_id, "child": child_id},
+            )
+            if _would_cycle(conn, child_id, creator_id):
+                report["skipped"].append((creator_id, child_id))
+                continue
+            _link(conn, child_id, creator_id)
+            _append_event(conn, creator_id, "linked", {"parent": child_id, "child": creator_id})
+            report["added"].append((child_id, creator_id))
+    recompute_ready(conn)
+    return report
+
+
+# ── HUMAN-HOLD PROPAGATION (P12e) ──────────────────────────────────────────
+# A human hold on a decomposed ROOT must gate the children that decomposition
+# spawned, or a child promotes and dispatches while the owner's GO is pending.
+_HUMAN_HOLD_KINDS = frozenset({"needs_input", "capability"})
+
+# Lineage, not the link graph: ``decompose_triage_task`` links the root UNDER
+# every child, so walking ``task_links`` upwards from a child can never reach
+# the root. UNION (not UNION ALL) also makes a malformed ``from_decompose_of``
+# cycle terminate.
+_LINEAGE_ROOT_SQL = """
+    WITH RECURSIVE up(id) AS (
+        SELECT json_extract(payload, '$.from_decompose_of') FROM task_events
+         WHERE task_id = ? AND kind = 'created'
+        UNION
+        SELECT json_extract(e.payload, '$.from_decompose_of') FROM task_events e
+          JOIN up ON e.task_id = up.id
+         WHERE e.kind = 'created'
+    )
+    SELECT id FROM up WHERE id IS NOT NULL
+"""
+
+
+def held_lineage_root(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, str]]:
+    """``(root_id, block_kind)`` when any ancestor named by a
+    ``from_decompose_of`` created-event chain is ``blocked`` for a human
+    (``needs_input``/``capability``), else ``None``. Read-only, and None (never
+    an exception) on a cycle or a missing ancestor row."""
+    for row in conn.execute(_LINEAGE_ROOT_SQL, (task_id,)):
+        root = conn.execute(
+            "SELECT id, status, block_kind FROM tasks WHERE id = ?", (row[0],),
+        ).fetchone()
+        if root is not None and root["status"] == "blocked" and root["block_kind"] in _HUMAN_HOLD_KINDS:
+            return (root["id"], root["block_kind"])
+    return None
+
+
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
     author: Optional[str], now: int,

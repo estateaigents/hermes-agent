@@ -429,6 +429,11 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# A latch only exists on a settled card (triage/todo/scheduled/blocked); clearing
+# it on a live or terminal card would race that card's own state writer.
+_BLOCK_LOOP_CLEAR_REFUSED_STATUSES = {"running", "ready", "review", "done", "archived"}
+
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3903,6 +3908,87 @@ def promote_task(
             return False, f"task {task_id} status changed during promotion"
         _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
 
+    return True, None
+
+
+def clear_block_loop(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str,
+) -> tuple[bool, Optional[str]]:
+    """Operator escape hatch for the block-loop latch; returns ``(ok, error)``.
+
+    :func:`_route_block` routes a card to ``triage`` once a typed block recurs
+    ``BLOCK_RECURRENCE_LIMIT`` times and appends ``block_loop_detected``; the
+    automatic retry paths then refuse the card forever, leaving a latched card
+    with no sanctioned way back into the worker pipeline. This is that way.
+
+    * zeroes ``block_recurrences`` so the guard's ``>= BLOCK_RECURRENCE_LIMIT``
+      test stops firing;
+    * appends a ``block_loop_cleared`` event carrying ``actor`` + ``reason``
+      (plus the previous counter, block kind, status and limit) so the
+      observer can see who cleared the latch and why;
+    * leaves ``status`` alone — the caller's normal promotion route does the
+      move, so a clear never promotes a spec nobody has read;
+    * KEEPS ``block_kind`` so the next same-kind re-block counts as recurrence
+      1 and the latch re-arms. A cleared latch is one human decision, not
+      amnesty for the cause.
+
+    Fail-closed: unknown task, a card that is not latched, a live or terminal
+    card (``_BLOCK_LOOP_CLEAR_REFUSED_STATUSES``) and a blank ``reason`` are all
+    refused. Every read-and-decide step runs INSIDE the same ``write_txn`` as
+    the write, and the ``UPDATE`` is conditional on the exact
+    ``(status, block_kind, block_recurrences)`` that was validated, so a
+    concurrent transition can never leave a card with a zeroed counter plus a
+    ``block_loop_cleared`` event.
+    """
+    if not (reason or "").strip():
+        return False, (
+            "reason is required: the block_loop_cleared event is the audit trail "
+            "for overriding an automatic guard"
+        )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        status = _row_get(row, "status")
+        block_kind = _row_get(row, "block_kind")
+        prev_recurrences = int(_row_get(row, "block_recurrences") or 0)
+        if status in _BLOCK_LOOP_CLEAR_REFUSED_STATUSES:
+            return False, (
+                f"task {task_id} is {status!r}; a block-loop latch only exists on a "
+                f"settled card (triage/todo/scheduled/blocked) — clearing it on a "
+                f"live or terminal card would race its own state writer"
+            )
+        latched = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'block_loop_detected' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latched is None or prev_recurrences < BLOCK_RECURRENCE_LIMIT:
+            return False, (
+                f"task {task_id} is not block-loop latched "
+                f"(block_loop_detected event={latched is not None}, "
+                f"block_recurrences={prev_recurrences} vs limit "
+                f"{BLOCK_RECURRENCE_LIMIT}) — nothing to clear"
+            )
+        upd = conn.execute(
+            "UPDATE tasks SET block_recurrences = 0 "
+            "WHERE id = ? AND status = ? AND block_kind IS ? "
+            "AND block_recurrences = ?",
+            (task_id, status, block_kind, prev_recurrences),
+        )
+        if upd.rowcount != 1:
+            return False, f"task {task_id} block-loop state changed during clear"
+        _append_event(conn, task_id, "block_loop_cleared", {
+            "actor": actor,
+            "reason": reason,
+            "previous_recurrences": prev_recurrences,
+            "block_kind": block_kind,
+            "status": status,
+            "limit": BLOCK_RECURRENCE_LIMIT,
+        })
     return True, None
 
 
