@@ -220,6 +220,21 @@ def specify_task(
         if new_body is None and new_title is None:
             return SpecifyOutcome(task_id, False, "LLM response missing title and body")
 
+    if new_body is not None:
+        # P2: never overwrite a frozen ACCEPTANCE block on the specify path; the
+        # DRAFT scaffold is injected only when the body carries none.
+        from hermes_cli.kanban_decompose import _inject_acceptance_block, _preserve_frozen_blocks
+
+        original = task.body or ""
+        if kb._frozen_acceptance_block(original) is not None:
+            # A PA-frozen contract is the published spec: an LLM paraphrase may
+            # not replace the body it was frozen from.
+            new_body = original
+        else:
+            new_body = _preserve_frozen_blocks(original, new_body)
+            if task.assignee == "programmer" and not kb._extract_acceptance_blocks(new_body):
+                new_body = _inject_acceptance_block(new_body, task.assignee, parent_body=original)
+
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn,
