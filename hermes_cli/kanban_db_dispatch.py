@@ -1568,7 +1568,7 @@ def check_respawn_guard(
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
+    a re-queue or ``changes_requested`` event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
     PR). The review lane skips the last two: they are the *inputs* to a review
@@ -1635,7 +1635,8 @@ def check_respawn_guard(
     success = max((t for t, _ in _rows_since(
         conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
     if success is not None and not any(_rows_since(
-            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
+            conn, "task_events", task_id, success,
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'changes_requested')")):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -2110,7 +2111,15 @@ def _dispatch_lane_task(
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                # One row per guard EPISODE: a card held for a day used to write
+                # one event per tick (1,440 rows) for one unchanged reason.
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "respawn_guarded"
+                        or last["payload"] != _kb._json_or_null({"reason": guard_reason})):
+                    _kb._append_event(
+                        conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2231,6 +2240,65 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    _self_heal_blocked_tasks(conn, result)
+
+
+def _is_assignee_retired_or_missing(assignee: Optional[str]) -> bool:
+    """True when *assignee* names a profile that can never work a card again.
+
+    Either the profile does not exist on this host, or its ``config.yaml``
+    carries ``retired: true`` (ADR-271: retired from the standing queue). Read
+    live on every call - an operator retires/unretires between ticks. A blank
+    assignee is NOT this case: that is unassigned work, bucketed separately.
+    """
+    if not assignee or not assignee.strip():
+        return False
+    try:
+        from hermes_cli.profiles import _load_yaml_dict, get_profile_dir, profile_exists
+    except Exception:
+        return False
+    try:
+        if not profile_exists(assignee):
+            return True
+        config = _load_yaml_dict(get_profile_dir(assignee) / "config.yaml") or {}
+        return bool(config.get("retired"))
+    except Exception:
+        return False
+
+
+def _self_heal_blocked_tasks(conn: sqlite3.Connection, result: DispatchResult) -> None:
+    """Reassign blocked cards whose assignee profile was retired or deleted.
+
+    A block addressed to a profile that cannot come back never clears - nobody
+    is left to unblock it, so the card deadlocks behind a dead name (GOV-4 /
+    ADR-271). Reassign, never complete: to the card's creator when that profile
+    is live, else unassign so it surfaces as routing work. ``result`` is the
+    tick's report; the heal itself is legible on the card's own events.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee, created_by FROM tasks "
+        "WHERE status = 'blocked' AND assignee IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        old = row["assignee"]
+        if not _is_assignee_retired_or_missing(old):
+            continue
+        creator = (row["created_by"] or "").strip() or None
+        new = creator if creator and not _is_assignee_retired_or_missing(creator) else None
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ? AND assignee = ?",
+                (new, row["id"], old),
+            )
+            _kb._append_event(
+                conn, row["id"], "self_healed",
+                {"assignee": old, "reassigned_to": new,
+                 "reason": "assignee_retired_or_missing"},
+            )
+        _kb._log.info(
+            "kanban self-heal: blocked %s reassigned %s -> %s "
+            "(assignee retired or missing)", row["id"], old, new,
+        )
 
 
 def _tick_spawn_budget(

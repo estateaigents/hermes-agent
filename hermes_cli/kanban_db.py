@@ -2448,16 +2448,22 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 
 
 def _children_terminal(conn: sqlite3.Connection, task_id: str) -> tuple[bool, list[tuple[str, str]]]:
-    """``(all_terminal, [(child_id, status), ...])`` for every direct child.
+    """``(no_child_queued, [(child_id, status), ...])`` for every direct child.
 
-    GOV-4 parent-card gate: a parent must never complete while any child is
-    blocked/todo/running, or the child's work is orphaned under a done parent.
+    GOV-4 parent-card gate: a parent must not complete while a child is
+    ``ready`` - the dispatcher would spawn queued work under a parent that has
+    already declared itself done. Every other non-terminal state is upstream-
+    supported and must NOT block, or the gate deadlocks the board it should
+    protect: ``todo`` (the dependency gate has not released the child yet -
+    finishing the parent is what promotes it), ``running``/``review`` (already
+    released and in flight; its claim proved the parents were terminal), and
+    ``blocked`` (parked on a human, incl. ``initial_status="blocked"``).
     ``(True, [])`` for a leaf card.
     """
     rows = conn.execute(
         "SELECT c.id, c.status FROM task_links l "
         "JOIN tasks c ON c.id = l.child_id "
-        "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') "
+        "WHERE l.parent_id = ? AND c.status = 'ready' "
         "ORDER BY c.id", (task_id,),
     ).fetchall()
     return (not rows), [(row["id"], row["status"]) for row in rows]
@@ -3024,8 +3030,8 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
-    # GOV-4 parent-card gate: completing now would orphan a live child under a
-    # done parent. Pre-txn only; the child re-opens nothing on the way out.
+    # GOV-4 parent-card gate: no child may be left queued (ready) under a
+    # parent that just declared itself done. Pre-txn only.
     children_ok, open_children = _children_terminal(conn, task_id)
     if not children_ok:
         raise ChildrenNotTerminalError(task_id, open_children)
