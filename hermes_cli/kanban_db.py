@@ -319,7 +319,7 @@ def _denial_since_epoch(since):
 
 
 def record_birth_denial(
-    conn, *, title, assignee=None, reason, kind="acceptance", board=None, extra=None,
+    conn, *, title, assignee, reason, kind="acceptance", board=None, extra=None,
 ):
     """Record one creation refusal as a `task_events` row; return its event id.
 
