@@ -111,8 +111,10 @@ def test_birth_denial_is_one_row_per_event_and_the_count_agrees(kanban_home):
 
 def test_birth_denial_since_filter(kanban_home):
     with kbc.connect() as conn:
-        old_id = kb.record_birth_denial(conn, title="old", reason="unparseable shell")
-        kb.record_birth_denial(conn, title="new", reason="unfilled placeholder")
+        old_id = kb.record_birth_denial(conn, title="old", assignee="programmer",
+                                        reason="unparseable shell")
+        kb.record_birth_denial(conn, title="new", assignee="programmer",
+                               reason="unfilled placeholder")
         conn.execute(
             "UPDATE task_events SET created_at = created_at - 86400 WHERE id = ?", (old_id,))
         cutoff = int(time.time()) - 3600
