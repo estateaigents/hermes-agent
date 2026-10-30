@@ -260,6 +260,165 @@ def _record_acceptance_freeze(
         _append_event(conn, task_id, "acceptance_refrozen", payload)
 
 
+# --- Birth denials (P12c) ---
+#
+# Creation denials are `task_events` rows, not a log file: the board DB is the
+# record of truth and the sentinel proves enforcement by event presence. A
+# REFUSED create has no task row, so every denial hangs off one sentinel task_id
+# and carries its own title/assignee in the payload.
+
+BIRTH_DENIAL_EVENT = "birth_denial"
+_BIRTH_DENIAL_TASK_ID = "birth-denial"
+
+# Coarse, stable classes (a brief aggregates on them) — raw reason is kept too.
+_BIRTH_DEFECT_CLASSES = (
+    (r"missing field\(s\)", "missing_field"),
+    (r"no runnable command tokens", "no_runnable_command"),
+    (r"whitespace-separated tokens|chars \(limit 40\)", "expected_not_one_token"),
+    (r"PATH shim detection|resolved to /usr/bin/dash|lead binary",
+     "lead_not_whitelisted"),
+    (r"missing required arm:|arm: block missing", "tooling_missing_arm"),
+    (r"exemption requires an `arm:` receipt", "probe_exempt_missing_arm"),
+    (r"ALREADY prints|pre-fix-false|exits 0 at birth", "probe_not_pre_fix_false"),
+    (r"unfilled placeholder", "unfilled_placeholder"),
+    (r"unparseable shell|syntax error", "unparseable_shell"),
+    (r"missing ## ACCEPTANCE", "missing_acceptance_block"),
+)
+
+
+def birth_defect_class(reason, kind="acceptance"):
+    """Coarse, stable class for a birth refusal (for the 07:00 brief)."""
+    text = reason or ""
+    for pattern, cls in _BIRTH_DEFECT_CLASSES:
+        if re.search(pattern, text):
+            return cls
+    return "gate_refused" if kind == "acceptance" else kind
+
+
+def _denial_since_epoch(since):
+    """``since`` as an epoch float: epoch number or ISO-8601 string."""
+    if since is None:
+        return None
+    if isinstance(since, (int, float)):
+        return float(since)
+    text = str(since).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("since must be an epoch number or an ISO-8601 timestamp")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def record_birth_denial(
+    conn, *, title, assignee=None, reason, kind="acceptance", board=None, extra=None,
+):
+    """Record one creation refusal as a `task_events` row; return its event id.
+
+    Best-effort BY DESIGN: a full disk or a read-only board must never turn a
+    refusal into a different refusal, so failures are reported on stderr instead
+    of masking the admission verdict (``None`` returned).
+    """
+    own = conn is None
+    try:
+        if own:
+            from hermes_cli.kanban_db_connect import connect
+            conn = connect(board=board)
+        payload = {
+            "kind": kind,
+            "defect_class": birth_defect_class(reason, kind),
+            "title": (title or "").strip()[:300],
+            "assignee": (assignee or "").strip() or None,
+            "reason": (reason or "").strip().replace("\n", " ")[:1000],
+            "pid": os.getpid(),
+        }
+        if extra:
+            payload.update(extra)
+        cur = conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (_BIRTH_DENIAL_TASK_ID, None, BIRTH_DENIAL_EVENT,
+             _json_or_null(payload), int(time.time())),
+        )
+        if own:
+            conn.commit()
+        return cur.lastrowid
+    except Exception as exc:  # pragma: no cover - defensive
+        try:
+            sys.stderr.write(
+                "kanban: WARNING birth denial NOT recorded (%s); the create was "
+                "still refused\n" % exc)
+        except Exception:
+            pass
+        return None
+    finally:
+        if own and conn is not None:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+def read_birth_denials(conn=None, *, since=None, board=None):
+    """Birth denial payloads (oldest first), optionally from ``since`` onward."""
+    own = conn is None
+    if own:
+        from hermes_cli.kanban_db_connect import connect
+        conn = connect(board=board)
+    try:
+        cutoff = _denial_since_epoch(since)
+        sql = "SELECT payload, created_at FROM task_events WHERE kind = ?"
+        args: list[Any] = [BIRTH_DENIAL_EVENT]
+        if cutoff is not None:
+            sql += " AND created_at >= ?"
+            args.append(int(cutoff))
+        out = []
+        for payload, created_at in conn.execute(sql + " ORDER BY id ASC", args):
+            entry = _json_dict(payload)
+            entry["ts"] = created_at
+            out.append(entry)
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+def birth_denial_count(conn=None, *, since=None, board=None):
+    """Number of creation denials recorded since ``since`` (07:00 brief hook).
+
+    Same filters as :func:`read_birth_denials` by construction, so the count can
+    never disagree with the rows an operator can list.
+    """
+    return len(read_birth_denials(conn, since=since, board=board))
+
+
+def _stamp_birth_verified(body: str, note: str) -> str:
+    """Add ``birth-verified: <note>`` to the body (idempotent, one line only).
+
+    Stamps the URL-DECODED text: accepted bodies arrive urlencoded, so matching
+    the raw body would silently never land. A second stamp is a no-op — a
+    duplicated receipt line is the same defect class as a double arm.
+    """
+    if not note:
+        return body
+    body = decode_urlencoded_newlines(body) or body or ""
+    if re.search(r"^birth-verified:", body, re.M):
+        return body
+    line = "birth-verified: " + note
+    m = _ACCEPTANCE_FROZEN_AT_RX.search(body)
+    if m:
+        return body[:m.start()] + line + "\n" + body[m.start():]
+    return body.rstrip("\n") + "\n" + line + "\n"
+
+
 # --- Constants ---
 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
