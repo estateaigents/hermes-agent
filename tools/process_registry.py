@@ -119,14 +119,14 @@ _SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
 _SYSTEMD_RUN_NO_EXPAND = True
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
-_WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+_WORKER_MEMORY_MAX_CAP_BYTES = 8 * 1024 * 1024 * 1024  # raised 4GiB->8GiB 2026-10-28: portal tsc/node anon-rss ~3.85GB OOM-killed at the 4GiB cap (t_da1b5dbf, t_3c1f894f, t_3e6e7e19, t_6a578e77)
 
 
 def _worker_memory_max_bytes() -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
     bound (min of the gateway's cgroup-v2 ``memory.max`` and half of physical RAM,
-    capped at 4 GiB), so an oversized override cannot exceed the enclosing slice.
+    capped at the 8 GiB worker cap), so an oversized override cannot exceed the enclosing slice.
 
     The proposed local-memory-guard environment override is honored when it tightens the safe bound, so this
     isolation composes with PR #57121 instead of inventing a second knob.
