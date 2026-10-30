@@ -15,6 +15,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -100,6 +101,163 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
     if result.returncode != 0:
         return None
     return (result.stdout or "").strip() or None
+
+
+# --- ACCEPTANCE-block parsing, DRAFT detection, freeze guards (P12a) ---
+# A card's frozen `## ACCEPTANCE` block is its contract. Two loss modes are
+# silent without this layer: a placeholder DRAFT (angle-bracket REQUIRED
+# markers, or a real `frozen_at` on a stub) dispatched as if it were a real
+# spec, and a block EDITED after it was frozen so the published criterion no
+# longer matches what was frozen - a probe that passes against a rewritten
+# test proves nothing. Parsing decodes legacy percent-0A newlines first, or a
+# filled block inside one giant line is invisible to every line-based reader.
+_URL_ENCODED_NEWLINE_RX = re.compile(r"%0A", re.IGNORECASE)
+_ACCEPTANCE_DRAFT_RX = re.compile(
+    r"<REQUIRED:|# DRAFT-ACCEPTANCE|PENDING_PA_FREEZE",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_FROZEN_AT_RX = re.compile(r"^\s*frozen_at:\s*(\S.*)$", re.MULTILINE)
+
+
+def decode_urlencoded_newlines(body: Any) -> Any:
+    """Decode literal percent-0A URL-encoded newlines back to real newlines.
+
+    Legacy autofiled bodies carried percent-0A instead of real line breaks, so
+    decode BEFORE any ACCEPTANCE parsing. ``None`` passes through; a BLOB cell
+    arrives as bytes, and one bad row must not raise.
+    """
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        body = bytes(body).decode("utf-8", errors="replace")
+    if not body or "%0A" not in body:
+        return body
+    return _URL_ENCODED_NEWLINE_RX.sub("\n", body)
+
+
+def _extract_acceptance_blocks(body: str) -> list[str]:
+    """Every ACCEPTANCE heading block in ``body`` (real-newline split), mirroring
+    the completion-verifier Gate 6 parser: block = heading through the next
+    heading line or end of body. Returns an empty list when none is parseable."""
+    if not body or "## ACCEPTANCE" not in body:
+        return []
+    lines = body.splitlines()
+    blocks: list[str] = []
+    for i, ln in enumerate(lines):
+        if ln.startswith("## ACCEPTANCE"):
+            block_lines = [ln]
+            for j in range(i + 1, len(lines)):
+                next_ln = lines[j]
+                if next_ln.startswith("## "):
+                    break
+                block_lines.append(next_ln)
+            blocks.append("\n".join(block_lines).rstrip())
+    return blocks
+
+
+def acceptance_block_is_draft(body: Optional[str]) -> bool:
+    """True when the body has at least one parseable ACCEPTANCE block and EVERY
+    parseable block is a placeholder draft.
+
+    A body with NO parseable ACCEPTANCE block returns False - a different gate
+    class (the creation/promote gate) owns block-less cards.
+    """
+    if not body:
+        return False
+    blocks = _extract_acceptance_blocks(decode_urlencoded_newlines(body))
+    if not blocks:
+        return False
+    return all(bool(_ACCEPTANCE_DRAFT_RX.search(b)) for b in blocks)
+
+
+def _frozen_acceptance_block(body: Optional[str]) -> Optional[str]:
+    """The first parseable ACCEPTANCE block carrying a real ``frozen_at``: the
+    frozen snapshot every verdict compares against. ``None`` = not frozen."""
+    for block in _extract_acceptance_blocks(decode_urlencoded_newlines(body) or ""):
+        m = _ACCEPTANCE_FROZEN_AT_RX.search(block)
+        if m and m.group(1).strip().upper() != "PENDING_PA_FREEZE":
+            return block
+    return None
+
+
+def _acceptance_field(block: str, name: str) -> str:
+    """One ``name: value`` scalar out of an ACCEPTANCE block (quotes stripped)."""
+    m = re.search(rf"^\s*{name}:\s*(\S.*)$", block, re.MULTILINE | re.IGNORECASE)
+    return m.group(1).strip().strip('"').strip("'").strip() if m else ""
+
+
+def _acceptance_block_digest(block: str) -> str:
+    """Identity of a frozen block: any edit anywhere in it changes the digest."""
+    return hashlib.sha256(block.strip().encode("utf-8")).hexdigest()
+
+
+def acceptance_gate_verdict(
+    body: Optional[str], *, frozen_body: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Kernel verdict on one card body: ``(defect, note)``.
+
+    ``defect`` non-empty -> the card FAILS (caller refuses it). ``note``
+    non-empty -> the kernel could not judge (not frozen / no block) and the
+    caller falls back to its own rules and records the skip. Never both.
+
+    The frozen-identity check runs FIRST and is independent of whether the
+    ``evidence_cmd`` now passes: an edited-after-freeze block is the
+    "acceptance test rewritten after it was frozen" loss mode.
+    """
+    current = _frozen_acceptance_block(decode_urlencoded_newlines(body) or "")
+    if current is None:
+        return (None, "no frozen ## ACCEPTANCE block in this body")
+    expected = _acceptance_field(current, "expected")
+    if not expected:
+        return (
+            "ACCEPTANCE.expected: missing or empty - Gate 6 compares ONE token "
+            "against ONE line, so a block without `expected:` can never be "
+            "satisfied. Write the single verdict token the probe prints.",
+            "",
+        )
+    reference = _frozen_acceptance_block(frozen_body) if frozen_body else None
+    if reference is not None and (
+        _acceptance_block_digest(reference) != _acceptance_block_digest(current)
+    ):
+        return (
+            "ACCEPTANCE: the frozen ## ACCEPTANCE block was EDITED after it was "
+            "frozen (expected was %r at freeze, is %r now; frozen digest %s, "
+            "current %s). Restore the frozen block and re-freeze deliberately."
+            % (
+                _acceptance_field(reference, "expected"), expected,
+                _acceptance_block_digest(reference)[:12],
+                _acceptance_block_digest(current)[:12],
+            ),
+            "",
+        )
+    return (None, "")
+
+
+def _record_acceptance_freeze(
+    conn: sqlite3.Connection, task_id: str,
+    old_body: Optional[str], new_body: Optional[str],
+) -> None:
+    """Record a body write that installs or changes a frozen ACCEPTANCE block.
+
+    Freeze enforcement is unobservable without the event row: a refreeze is
+    exactly what an auditor needs to see, because it is the moment the
+    published contract changed. Unfrozen or unchanged block -> no event.
+    """
+    new_block = _frozen_acceptance_block(new_body)
+    if new_block is None:
+        return
+    old_block = _frozen_acceptance_block(old_body)
+    new_digest = _acceptance_block_digest(new_block)
+    if old_block is not None and _acceptance_block_digest(old_block) == new_digest:
+        return
+    payload = {
+        "sha256": new_digest,
+        "expected": _acceptance_field(new_block, "expected"),
+        "frozen_at": _ACCEPTANCE_FROZEN_AT_RX.search(new_block).group(1).strip(),
+    }
+    if old_block is None:
+        _append_event(conn, task_id, "acceptance_frozen", payload)
+    else:
+        payload["previous_sha256"] = _acceptance_block_digest(old_block)
+        _append_event(conn, task_id, "acceptance_refrozen", payload)
 
 
 # --- Constants ---
@@ -1319,6 +1477,7 @@ def create_task(
                             "dependency_wait",
                             {"reason": "parent_not_done", "parent": gating[0]},
                         )
+                _record_acceptance_freeze(conn, task_id, None, body)
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -2120,6 +2279,22 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def _children_terminal(conn: sqlite3.Connection, task_id: str) -> tuple[bool, list[tuple[str, str]]]:
+    """``(all_terminal, [(child_id, status), ...])`` for every direct child.
+
+    GOV-4 parent-card gate: a parent must never complete while any child is
+    blocked/todo/running, or the child's work is orphaned under a done parent.
+    ``(True, [])`` for a leaf card.
+    """
+    rows = conn.execute(
+        "SELECT c.id, c.status FROM task_links l "
+        "JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') "
+        "ORDER BY c.id", (task_id,),
+    ).fetchall()
+    return (not rows), [(row["id"], row["status"]) for row in rows]
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
@@ -2622,6 +2797,24 @@ class LiveClaimError(ValueError):
         )
 
 
+class ChildrenNotTerminalError(ValueError):
+    """``complete_task`` refused: a direct child is not done/archived yet.
+
+    GOV-4 parent-card gate. A ``ValueError`` so the tool handler reports it as a
+    recoverable rejection - nothing was mutated and no run was closed.
+    """
+
+    def __init__(self, task_id: str, open_children: list[tuple[str, str]]):
+        self.task_id = task_id
+        self.open_children = open_children
+        named = ", ".join(cid + " (" + status + ")" for cid, status in open_children)
+        super().__init__(
+            str(task_id) + " has " + str(len(open_children)) + " open child(ren) - "
+            + named + "; complete or archive them first "
+            "(GOV-4 parent-card gate, nothing changed)"
+        )
+
+
 def _claim_is_live(trow) -> bool:
     """True when a ``running`` task's claim still protects a run: the worker process
     it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
@@ -2663,6 +2856,11 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # GOV-4 parent-card gate: completing now would orphan a live child under a
+    # done parent. Pre-txn only; the child re-opens nothing on the way out.
+    children_ok, open_children = _children_terminal(conn, task_id)
+    if not children_ok:
+        raise ChildrenNotTerminalError(task_id, open_children)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -3783,6 +3981,7 @@ def specify_triage_task(
             conn, task_id, "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
+        _record_acceptance_freeze(conn, task_id, existing["body"], body)
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
