@@ -1538,6 +1538,15 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    # P2: the create path never rewrites a frozen ACCEPTANCE block, and the
+    # DRAFT scaffold goes in only when the body carries no block at all. Reuses
+    # the decompose guards so a repeated create stays arm-idempotent.
+    if body and assignee == "programmer":
+        from hermes_cli.kanban_decompose import _ensure_arm_block, _inject_acceptance_block
+        if not _extract_acceptance_blocks(body):
+            body = _inject_acceptance_block(body, assignee)
+        body = _ensure_arm_block(body)
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
