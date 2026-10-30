@@ -3620,8 +3620,9 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    extra_event: Optional[tuple[str, dict]] = None,
 ):
-    """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
+    """``running``/``ready``/``probe_repair`` -> ``review``; never touches block recurrence accounting.
 
     Implementer and reviewer are recorded on the event so requested changes
     route back to the right profile; ``reviewer`` reassigns the task, and on
@@ -3637,6 +3638,9 @@ def request_review(
     upload. A declared artifact that cannot be preserved raises
     :class:`ArtifactPreservationError`, rolling the whole transition back: the
     task stays ``running`` and retryable, with no attachments and no event.
+
+    ``extra_event`` is an extra ``(kind, payload)`` task_event appended in the same
+    transaction as the handoff (an exit that cannot be logged must not happen).
     """
 
     def _ret(ok: bool, reason: Optional[str] = None):
@@ -3712,13 +3716,13 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'probe_repair')
                 """ + run_guard,
                 params,
             )
             if cur.rowcount != 1:
                 return _ret(
-                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
+                    False, "task is not in running/ready/probe_repair (or expected_run_id did not match the current run)",
                 )
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
@@ -3738,6 +3742,9 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+            if extra_event is not None:
+                extra_kind, extra_payload = extra_event
+                _append_event(conn, task_id, extra_kind, extra_payload, run_id=run_id)
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)

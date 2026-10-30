@@ -2350,6 +2350,312 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+# ── probe_repair lane (P12d; re-homed from the live kanban t_dfde2737 kernel) ─
+#
+# ``probe_repair`` is a REPAIR lane, not a free retry: a card arrives here when
+# its acceptance probe could not RUN (machinery failure) and leaves only on a
+# PASSING re-verify recorded AFTER that routing. Without this exit the lane is a
+# dead end. Routing INTO the lane is the completion gate's job, not this module's.
+PROBE_REPAIR_STATUS = "probe_repair"
+PROBE_REPAIR_EXIT_EVENT = "probe_repair_exited"
+# The seat a lane exit hands the card to. It must differ from the implementer,
+# otherwise the handoff carries no implementer provenance and
+# request_changes() refuses -- the lane would be a dead end again.
+PROBE_REPAIR_REVIEWER = "code-reviewer"
+
+
+def _load_probe_contract():
+    """``plugins/completion-verifier/probe_contract.py`` or ``None``.
+
+    ``None`` keeps every caller fail-CLOSED: no receipt, no lane exit.
+    """
+    import importlib.util
+
+    from hermes_constants import get_hermes_home
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = str(get_hermes_home())
+    for path in (
+        os.path.join(home, "plugins", "completion-verifier", "probe_contract.py"),
+        os.path.join(here, "plugins", "completion-verifier", "probe_contract.py"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_kanban_probe_contract", path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if callable(getattr(mod, "read_verdicts", None)):
+                return mod
+        except Exception as exc:  # pragma: no cover - defensive
+            _kb._log.debug("probe_contract load failed at %s: %s", path, exc)
+    return None
+
+
+def _verdict_epoch(verdict: dict) -> Optional[float]:
+    """Epoch seconds of a verdict record's ``ts`` ISO stamp, or ``None``."""
+    from datetime import datetime, timezone
+
+    ts = verdict.get("ts")
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _probe_repair_routed_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Epoch of the card's most recent routing INTO the ``probe_repair`` lane."""
+    row = conn.execute(
+        "SELECT MAX(created_at) AS ts FROM task_events WHERE task_id = ? AND kind = ?",
+        (task_id, PROBE_REPAIR_STATUS),
+    ).fetchone()
+    if row is None or row["ts"] is None:
+        return None
+    return int(row["ts"])
+
+
+def _load_shared_acceptance_block():
+    """``plugins/_shared_acceptance_block.py`` -- the ONE ACCEPTANCE-block
+    locator Gate 6 hashes with -- or ``None`` (a block-bound card then fails
+    closed: an unverifiable binding is not a passed binding)."""
+    import importlib.util
+
+    from hermes_constants import get_hermes_home
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    home = str(get_hermes_home())
+    for path in (
+        os.path.join(home, "plugins", "_shared_acceptance_block.py"),
+        os.path.join(home, "plugins", "completion-verifier", "_shared_acceptance_block.py"),
+        os.path.join(here, "plugins", "_shared_acceptance_block.py"),
+        os.path.join(here, "plugins", "completion-verifier", "_shared_acceptance_block.py"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("_kanban_shared_acceptance_block", path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if callable(getattr(mod, "acceptance_block_raw", None)):
+                return mod
+        except Exception as exc:  # pragma: no cover - defensive
+            _kb._log.debug("_shared_acceptance_block load failed at %s: %s", path, exc)
+    return None
+
+
+def _receipt_binds_effective_block(
+    conn: sqlite3.Connection, contract: Any, task_id: str, rec: dict,
+) -> bool:
+    """True when *rec* was produced against the ACCEPTANCE block the card carries NOW.
+
+    A re-written block must not inherit an old pass: the verdict has to name the
+    current block -- declared ``block_hash:`` else its sha256 -- and, when both
+    name a command, the same command. Trivially true for a card with no
+    ACCEPTANCE block: there is nothing to bind to.
+    """
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    body = (row["body"] or "") if row is not None else ""
+    shared = _load_shared_acceptance_block()
+    parser = getattr(contract, "parse_block", None)
+    if shared is None or not callable(parser):
+        # Nothing can be bound, so only a card with NO ACCEPTANCE block may skip
+        # binding. The substring test is wider than the real locator, so a prose
+        # mention can only make us hold -- never silently accept a stale pass.
+        return "## ACCEPTANCE" not in body
+    raw = shared.acceptance_block_raw(body)
+    if not raw:
+        return True
+    try:
+        parsed = parser(raw) or {}
+    except Exception:  # pragma: no cover - defensive
+        return False
+    expected = parsed.get("block_hash")
+    if not expected:
+        hasher = getattr(contract, "block_hash", None)
+        if not callable(hasher):
+            return False
+        expected = hasher(raw)
+    if rec.get("block_hash") != expected:
+        return False
+    cmd = (parsed.get("cmd") or "").strip()
+    if not cmd:
+        return True
+    probe_cmd = rec.get("probe_cmd")
+    return isinstance(probe_cmd, str) and probe_cmd.strip() == cmd
+
+
+def _probe_repair_implementer(
+    conn: sqlite3.Connection, trow, reviewer: Optional[str],
+) -> Optional[str]:
+    """Profile that did the work: the active run's profile, else the assignee --
+    in both cases only when DISTINCT from *reviewer*.
+
+    ``None`` means there is no durable, distinct implementer, so the exit would
+    hand back a card that reviews itself -- such a card is held, not exited.
+    """
+    if not reviewer:
+        return None
+    if trow["current_run_id"] is not None:
+        arow = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],),
+        ).fetchone()
+        if arow is not None and arow["profile"]:
+            run_profile = _kb._canonical_assignee(arow["profile"])
+            if run_profile and run_profile != reviewer:
+                return run_profile
+    assignee = _kb._canonical_assignee(trow["assignee"])
+    if assignee and assignee != reviewer:
+        return assignee
+    return None
+
+
+def probe_repair_pass_receipt(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """The runner verdict proving the repaired probe re-verified GREEN.
+
+    Fail-closed: ``None`` when the probe contract is unavailable, the ledger is
+    unreadable, or the latest verdict is not a pass recorded at/after the
+    routing event. The caller then keeps the card in the lane -- a missing
+    receipt never silently becomes a done. Only the LATEST verdict counts: a
+    newer fail/error invalidates an older pass, and a ledger with no routing
+    event cannot establish that any pass came after the routing.
+    """
+    contract = _load_probe_contract()
+    if contract is None:
+        return None
+    reader = getattr(contract, "read_verdicts", None)
+    if not callable(reader):
+        return None
+    try:
+        verdicts = reader(task_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        _kb._log.debug("read_verdicts(%s) failed: %s", task_id, exc)
+        return None
+    if not verdicts:
+        return None
+    routed_at = _probe_repair_routed_at(conn, task_id)
+    if routed_at is None:
+        return None
+    for rec in reversed(verdicts):  # newest first
+        if not isinstance(rec, dict):
+            continue
+        # This IS the latest verdict: qualify it or hold, never fall through to
+        # an older pass a newer verdict has already contradicted. ``status_ok``
+        # must be an explicit boolean TRUE.
+        if rec.get("verdict") != "pass" or rec.get("status_ok") is not True:
+            return None
+        runner = rec.get("runner")
+        if runner is not None and not str(runner).startswith("completion-runner"):
+            return None
+        ts = _verdict_epoch(rec)
+        if ts is None:
+            return None
+        if ts < routed_at - 1:  # -1 tolerates same-second ordering
+            return None
+        if not _receipt_binds_effective_block(conn, contract, task_id, rec):
+            return None
+        return rec
+    return None
+
+
+def probe_repair_exit_ready(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card sits in ``probe_repair`` AND carries a re-verify pass."""
+    return (
+        _kb._task_status(conn, task_id) == PROBE_REPAIR_STATUS
+        and probe_repair_pass_receipt(conn, task_id) is not None
+    )
+
+
+def resolve_probe_repair_lane(
+    conn: sqlite3.Connection, *, task_id: Optional[str] = None, dry_run: bool = False,
+) -> dict:
+    """Move repair-lane cards whose probe re-verified green into ``review``.
+
+    ``probe_repair -> review`` is the completable phase: a reviewer/PA approves
+    it and ``kanban complete`` accepts ``review`` as a source status. The move
+    is :func:`request_review` itself, so the exit carries a real handoff
+    (implementer + reviewer provenance, the run closed, ``review_requested``
+    logged) and the ``probe_repair_exited`` event lands in the same transaction.
+    Held cards simply stay put -- no counter, no re-spawn -- so a tick can
+    neither spin nor fan out. Idempotent and fail-open per card (one unreadable
+    ledger cannot abort a dispatcher tick).
+
+    Returns ``{"exited": [ids], "held": [ids], "to": {id: "review"}, "dry_run": bool}``.
+    """
+    if task_id is not None:
+        rows = conn.execute(
+            "SELECT id, assignee, current_run_id FROM tasks WHERE id = ? AND status = ?",
+            (task_id, PROBE_REPAIR_STATUS),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, assignee, current_run_id FROM tasks WHERE status = ?",
+            (PROBE_REPAIR_STATUS,),
+        ).fetchall()
+    exited: list[str] = []
+    held: list[str] = []
+    moved: dict[str, str] = {}
+    for row in rows:
+        tid = row["id"]
+        try:
+            receipt = probe_repair_pass_receipt(conn, tid)
+        except Exception as exc:  # pragma: no cover - defensive
+            _kb._log.warning("probe_repair receipt read failed for %s: %s", tid, exc)
+            receipt = None
+        if receipt is None:
+            held.append(tid)
+            continue
+        # A lane exit is a real handoff, so it needs both seats. Checked before
+        # ``dry_run`` so a preview cannot promise an exit the sweep would hold.
+        if _probe_repair_implementer(conn, row, PROBE_REPAIR_REVIEWER) is None:
+            held.append(tid)
+            continue
+        if dry_run:
+            exited.append(tid)
+            moved[tid] = "review"
+            continue
+        evidence = {
+            "to": "review",
+            "via": "probe_repair_pass_receipt",
+            "verdict_ts": receipt.get("ts"),
+            "exit_code": receipt.get("exit_code"),
+            "probe_cmd": receipt.get("probe_cmd"),
+            "block_hash": receipt.get("block_hash"),
+        }
+        try:
+            ok, reason = _kb.request_review(
+                conn, tid,
+                summary="probe_repair exit: acceptance probe re-verified PASS",
+                metadata={"probe_repair_exit": evidence},
+                reviewer=PROBE_REPAIR_REVIEWER, with_reason=True,
+                # Atomic with the handoff: an exit that cannot be logged must
+                # not happen (the card stays in the lane, next tick retries).
+                extra_event=(PROBE_REPAIR_EXIT_EVENT, evidence),
+            )
+        except Exception as exc:
+            # The handoff rolled back with its event: hold this card only.
+            _kb._log.warning("probe_repair exit failed for %s (rolled back): %s", tid, exc)
+            held.append(tid)
+            continue
+        if not ok:
+            _kb._log.info("probe_repair exit held for %s: %s", tid, reason)
+            held.append(tid)
+            continue
+        exited.append(tid)
+        moved[tid] = "review"
+    return {"exited": exited, "held": held, "to": moved, "dry_run": bool(dry_run)}
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2378,6 +2684,13 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # P12d: repair-lane cards whose probe re-verified green go back to review.
+    # Held cards stay held on the next tick (no counter, no re-spawn), so this
+    # cannot fan out; a broken ledger must never abort the tick.
+    try:
+        resolve_probe_repair_lane(conn, dry_run=dry_run)
+    except Exception as exc:
+        _kb._log.warning("probe_repair lane resolve failed: %s", exc)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
