@@ -55,6 +55,7 @@ def test_execution_is_opt_in(tmp_path, monkeypatch):
     assert "disabled at birth" in why
 
 
+@pytest.mark.live_system_guard_bypass  # the probe's own timeout path SIGKILLs its child script
 def test_timeout_is_recorded_as_a_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(bp, "_BIRTH_PROBE_TIMEOUT", 1)
     script = _script(tmp_path, "#!/bin/sh\nsleep 5\n")
