@@ -7,6 +7,7 @@ import io
 import itertools
 import logging
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -355,6 +356,29 @@ def _dotenv_lookup_env(load_pass: int | None) -> dict[str, str]:
     return lookup_env
 
 
+_PATH_DEFAULT = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_PATH_REF = re.compile(r"\$\{PATH[:}]")
+
+
+def _seed_path_lookup(
+    assignments: list[tuple[str, str | None]], lookup_env: dict[str, str],
+) -> dict[str, str]:
+    """Give a ``${PATH}`` reference a PATH with system bin dirs when the baseline has none.
+
+    A profile's ``.env`` says ``export PATH=<profile>/bin:${PATH}``; a served child published the raw,
+    unexpanded line as its own PATH, so the reference resolves against either nothing or a value that is
+    still ``<profile>/bin:${PATH}``. Both publish a PATH holding no system bin dir, and every subprocess
+    then fails 127 (``/usr/bin/env: 'bash': No such file or directory``). ``os.defpath`` starts with ``:``
+    (cwd), so use the explicit dirs instead.
+    """
+    if not any(value and _PATH_REF.search(value) for _, value in assignments):
+        return lookup_env
+    current = lookup_env.get("PATH") or ""
+    if current and "${" not in current:
+        return lookup_env
+    return {**lookup_env, "PATH": _PATH_DEFAULT}
+
+
 def _resolve_dotenv_assignments(
     assignments: list[tuple[str, str | None]], lookup_env: dict[str, str], *, override: bool,
 ) -> dict[str, str | None]:
@@ -363,6 +387,7 @@ def _resolve_dotenv_assignments(
     *override*, the environment otherwise)."""
     from dotenv.variables import parse_variables
 
+    lookup_env = _seed_path_lookup(assignments, lookup_env)
     resolved: dict[str, str | None] = {}
     for name, value in assignments:
         if value is not None:

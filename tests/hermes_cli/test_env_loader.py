@@ -622,3 +622,31 @@ def test_dotenv_published_dashboard_session_token_still_reloads(tmp_path, monkey
     (home / ".env").write_text("HERMES_DASHBOARD_SESSION_TOKEN=second\n", encoding="utf-8")
     load_hermes_dotenv(hermes_home=home)
     assert os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] == "second"
+
+
+def test_dotenv_path_reference_without_baseline_path_still_resolves_bash(tmp_path, monkeypatch):
+    """``export PATH=/x:${PATH}`` must gain system bin dirs when the baseline PATH is unusable.
+
+    A served child publishes a profile's raw, unexpanded ``.env`` line as its own PATH, so the reference
+    resolves against nothing or against a value that still holds the literal token. Either way the
+    published PATH held no system bin dir, and every subprocess failed 127
+    (``/usr/bin/env: 'bash': No such file or directory``), which the completion-verifier reported as
+    ``bash: command not found in PATH``.
+    """
+    import subprocess
+    from hermes_cli.env_loader import _load_dotenv_with_fallback
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("export PATH=/x:${PATH}\n", encoding="utf-8")
+
+    for baseline in (None, "/root/.hermes/profiles/some-seat/bin:${PATH}"):
+        if baseline is None:
+            monkeypatch.delenv("PATH", raising=False)
+        else:
+            monkeypatch.setenv("PATH", baseline)
+        _load_dotenv_with_fallback(env_file, override=True)
+        value = os.environ["PATH"]
+        assert "${PATH}" not in value
+        assert value.startswith("/x:")
+        assert "/usr/bin" in value.split(os.pathsep)
+        assert subprocess.run(["bash", "-c", "true"], env={"PATH": value}).returncode == 0
