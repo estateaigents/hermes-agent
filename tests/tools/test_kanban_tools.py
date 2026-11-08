@@ -195,6 +195,34 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_persists_top_level_receipts(worker_env):
+    """Gate 4 reads sha/branch/receipts at the top level of the args, so the schema
+    mirrors them there; the handler must persist them with the run too (t_bef91904)."""
+    from tools import kanban_tools as kt
+    receipts = [{"claim": "probe prints PASS",
+                 "file": "scripts/verify/probes/kanban_metadata_schema_probe.sh",
+                 "evidence_cmd": "bash scripts/verify/probes/kanban_metadata_schema_probe.sh",
+                 "exit_code": 0}]
+    out = kt._handle_complete({
+        "summary": "done",
+        "sha": "abc123",
+        "branch": "fix/x",
+        "receipts": receipts,
+    })
+    assert json.loads(out)["ok"] is True
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None and run.metadata is not None
+        assert run.metadata["sha"] == "abc123"
+        assert run.metadata["branch"] == "fix/x"
+        assert run.metadata["receipts"] == receipts
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

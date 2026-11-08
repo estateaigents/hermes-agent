@@ -729,6 +729,11 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = _redact_opt(args.get("summary"))
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
+    # Top-level sha/branch/receipts are the shape Gate 4 reads off the args; persist
+    # them with the run too so reviewers see the same receipts (t_bef91904).
+    mirrors = {k: args[k] for k in ("sha", "branch", "receipts") if args.get(k)}
+    if mirrors:
+        metadata = {**mirrors, **(metadata if isinstance(metadata, dict) else {})}
     if isinstance(metadata, dict):
         # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
         metadata = _redact_metadata(metadata) or metadata
