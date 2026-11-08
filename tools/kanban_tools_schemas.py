@@ -31,6 +31,103 @@ def _board_schema_prop() -> dict[str, str]:
     return _prop("string", _DESC_BOARD)
 
 
+def _receipt_item_schema() -> dict[str, Any]:
+    """One verification receipt. Mirrors the shared per-receipt schema the governance
+    plugins validate (``{claim, file, evidence_cmd, exit_code:int}``)."""
+    return {
+        "type": "object",
+        "properties": {
+            "claim": _prop("string", "What this receipt proves, in one line."),
+            "file": _prop("string", "Absolute path of the evidence file or probe target."),
+            "evidence_cmd": _prop("string", "Frozen read-only shell command whose output backs the claim."),
+            "exit_code": _prop("integer", "Exit code of evidence_cmd (0 = pass)."),
+        },
+        "additionalProperties": True,
+    }
+
+
+# Keys the governance plugins (merge-gate, completion-verifier) read out of completion
+# metadata. Constrained/grammar-based decoders (provider-side strict structured outputs,
+# e.g. openrouter deepseek-v4.1-flash) can only emit keys declared in ``properties`` — a
+# bare ``{"type": "object"}`` node reaches the wire as ``{}`` and every completion then
+# looks prose-only (t_eceb3c0c). Declared keys are the gate-consumed set;
+# ``additionalProperties: True`` keeps free-form facts deliverable on unconstrained models.
+_METADATA_PROPERTIES: dict[str, Any] = {
+    "sha": _prop("string", "Merged/head commit SHA this completion is backed by."),
+    "commit_sha": _prop("string", "Alias for ``sha``; gates accept either."),
+    "branch": _prop("string", "Git branch the work landed on."),
+    "repo": _prop("string", "Repo slug the change belongs to."),
+    "pr_url": _prop("string", "Pull-request URL for the change."),
+    "published_pr": _prop("string", "PR URL published under a completion_contract."),
+    "production_url": _prop("string", "Live URL where the change is deployed."),
+    "change_kind": _prop("string", (
+        "Completion class — e.g. 'host-config' or 'ops' for the sha-less "
+        "receipt pattern; omit for repo-backed code changes.")),
+    "no_repo_sha": _prop("boolean", (
+        "True when the work intentionally lives outside any git repo "
+        "(host-config); pairs with receipts[].")),
+    "changed_files": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Absolute paths of every file this attempt changed.",
+    },
+    "scope": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Declared scope paths; every changed path must lie inside them.",
+    },
+    "receipts": {
+        "type": "array", "items": _receipt_item_schema(),
+        "description": (
+            "Verification receipts: {claim, file, evidence_cmd, exit_code} per probe. "
+            "Required (non-empty) for sha-less host-config completions."),
+    },
+    "rollback": _prop("string", (
+        "Real path or command that reverts this change "
+        "(never 'none'/'n-a'/'todo').")),
+    "summary": _prop("string", "One-line machine-readable outcome note."),
+    "tests_run": _prop("integer", "Number of tests executed for this attempt."),
+    "findings": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Notable findings from this attempt.",
+    },
+    "decisions": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Decisions taken, for reviewers and downstream workers.",
+    },
+    # Review-class acceptance paths read by completion-verifier Gate 4
+    # (_extract_ledger_receipt / REVIEW_CLASS_RECEIPT_MARKER). Undeclared keys are
+    # unreachable from a constrained decoder, so a review seat could never close a
+    # REVIEW-class card (t_cbc6b83e).
+    "REVIEW_CLASS_RECEIPT": _prop("string", (
+        "Review-seat marker. A value containing REVIEW_CLASS_RECEIPT makes Gate 4 "
+        "accept a review card that has no sha/receipts.")),
+    "ledger_receipt": {
+        "type": "object",
+        "description": (
+            "Review LEDGER receipt — the gh api .../pulls/N/reviews readback for "
+            "this verdict. Gate 4 requires author + state + commit."),
+        "properties": {
+            "author": _prop("string", "Review author login."),
+            "state": _prop("string", "Review state (APPROVED/CHANGES_REQUESTED/COMMENTED)."),
+            "commit": _prop("string", "Commit id the review is pinned to."),
+            "evidence_cmd": _prop("string", "Command whose output carries the readback."),
+        },
+        "additionalProperties": True,
+    },
+}
+
+
+def _metadata_prop(description: str) -> dict[str, Any]:
+    """Completion/handoff ``metadata`` schema with EXPLICIT properties. Never declare this
+    as a bare ``{"type": "object"}``: constrained decoders collapse property-less objects
+    to ``{}`` (t_eceb3c0c — total completion outage for strict-model workers)."""
+    return {
+        "type": "object",
+        "description": description,
+        "properties": {k: dict(v) for k, v in _METADATA_PROPERTIES.items()},
+        "additionalProperties": True,
+    }
+
+
 def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
     return {
@@ -114,7 +211,14 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Run History on the dashboard and in downstream "
                 "workers' context."
         )),
-        "metadata": _prop("object", (
+        # METADATA_PERMISSIVE_FIX: metadata MUST be an open object. A bare
+        # _prop("object", ...) sanitizes to {"properties": {}, "required": []}
+        # (tools/schema_sanitizer.py::_empty_object) which constrained decoding
+        # reads as a CLOSED object, so a worker can only ever emit metadata={}
+        # and the merge-gate OPS/host-config exemption (change_kind+receipts)
+        # is unreachable via the tool call. Explicit additionalProperties:True
+        # mirrors kanban_request_review.metadata. See t_4b3b9ed5.
+        "metadata": _metadata_prop((
                 "Free-form dict of structured facts about this "
                 "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
@@ -245,14 +349,10 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional reviewer profile. When provided, the task is "
                 "reassigned to that profile before review dispatch."
         )),
-        "metadata": {
-            "type": "object",
-            "description": (
-                "Optional structured handoff facts for the reviewer, such "
-                "as changed_files, tests_run, commit, or decisions."
-            ),
-            "additionalProperties": True,
-        },
+        "metadata": _metadata_prop((
+            "Optional structured handoff facts for the reviewer, such "
+            "as changed_files, tests_run, commit, or decisions."
+        )),
         "artifacts": {
             "type": "array",
             "items": {"type": "string"},
