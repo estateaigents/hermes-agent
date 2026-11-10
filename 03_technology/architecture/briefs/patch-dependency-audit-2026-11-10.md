@@ -2,7 +2,7 @@
 
 ## Scope and method
 
-Read-only audit of `fix/regraft-p2-reland` at `491b19e7978613f0d54f55162a54c54a5abb84ec`, compared with local `upstream/main` at `cdf7ea4d0893e3cdd4ea9b2c12a554bda1164dd8`. The population is exactly the 14 commits returned by `git log --reverse upstream/main..HEAD`. No patch was dropped, reverted, rebased, or edited.
+Read-only audit of `fix/regraft-p2-reland` at `491b19e7978613f0d54f55162a54c54a5abb84ec`, compared with local `upstream/main` at `cdf7ea4d0893e3cdd4ea9b2c12a554bda1164dd8`. The population is exactly the 14 commits returned by `git log --reverse upstream/main..HEAD`; P01–P14 preserve that topology order. No patch was dropped, reverted, rebased, or edited.
 
 `FILE-UPSTREAM` means retain in the carrier until an upstream change lands; it does not mean safe to delete now. `RETIRE` identifies a candidate for a later, separately authorised removal, normally together with the related machinery named below.
 
