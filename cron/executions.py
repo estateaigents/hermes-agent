@@ -99,6 +99,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    add_column_if_missing(conn, "executions", "output_path", "output_path TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -280,6 +281,21 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
         )
         if cur.rowcount != 1:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
+
+
+def set_execution_output_path(execution_id: str, path: str) -> bool:
+    """Record the artifact this execution wrote (receipt leg 3).
+
+    Deliberately not fenced on process/pid or status: the recovery path records from another
+    process, before ``finish_execution``. First write wins, so a later run or recovery pass can
+    never re-point an earlier execution's receipt.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET output_path=? WHERE id=? AND output_path IS NULL",
+            (str(path), execution_id),
+        )
+        return cur.rowcount == 1
 
 
 def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]]:

@@ -531,7 +531,8 @@ from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     FIRER_FINISHED_STATES, _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
+    recover_interrupted_executions, set_execution_output_path, settle_unstarted_execution,
+    terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
 from cron.scheduler_bookkeeping import _classify_delivery_outcome
 from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
@@ -3073,7 +3074,16 @@ def _save_compose_deliver(
         # remove_job() already deleted this job's output dir; saving would re-create an orphan.
         output_file = (
             None if self_removal_delivery_allowed(job["id"])
-            else save_job_output(job["id"], output))
+            else save_job_output(job["id"], output, execution_id=job.get("execution_id")))
+        # Receipt leg 3: bind this run to the artifact it just wrote. Metadata only — a receipt
+        # that cannot be recorded must never fail, delay or alter the run's delivery.
+        if output_file is not None and job.get("execution_id"):
+            try:
+                set_execution_output_path(job["execution_id"], str(output_file))
+            except Exception:
+                logger.warning(
+                    "Job '%s': could not record output_path for execution %s",
+                    job["id"], job.get("execution_id"), exc_info=True)
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
 
