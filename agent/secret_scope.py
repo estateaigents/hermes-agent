@@ -408,7 +408,16 @@ def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     """Build a profile's secret mapping from ``<home>/.env`` plus its external
     secret sources. Global vars are NOT copied in — ``get_secret`` reads those
     from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
+    # Drop globals from the ``.env`` too: ``load_env_file`` is a read-only tokenizer, so
+    # ``export PATH=<home>/bin:${PATH}`` comes back RAW and a consumer that overlays this mapping onto a
+    # child env (``served_profile_child_env``, ``hermes_subprocess_env``) published the literal token as
+    # the child's PATH — no system bin dir, so its ``#!/usr/bin/env bash`` children died 127. A global's
+    # value is the parent process's; a child inherits the parent's PATH/HOME/TERM instead (t_960abc57).
+    # shortcut: only global NAMES are dropped, so another name's own ``${VAR}`` reference still publishes
+    # literally — expand it at that reader if a profile ever needs one.
+    secrets = {
+        k: v for k, v in load_env_file(Path(hermes_home) / ".env").items() if not _is_global_env(k)
+    }
     try:
         from hermes_cli.env_loader import get_secret_source_values
         external_secrets = get_secret_source_values(Path(hermes_home))
