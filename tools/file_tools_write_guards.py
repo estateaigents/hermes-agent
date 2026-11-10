@@ -359,6 +359,55 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
     return _request_protected_instruction_approval(reasons, task_id)
 
 
+# Branches of a checkout a repo-maintenance pass pins to ``origin/main`` (git reset --hard /
+# git checkout -- .). A linked worktree has its own branch, so it is never matched here.
+_PINNED_CHECKOUT_BRANCHES = frozenset({"main", "master"})
+
+
+def _protected_write_durability_warning(filepath: str, task_id: str = "default") -> str | None:
+    """Warn when a protected-instruction write only exists in a SHARED main checkout.
+
+    ``verified: true`` says the bytes landed; it does not say they survive. A checkout
+    pinned to ``origin/main`` is reset by repo-maintenance passes, which discard an
+    uncommitted edit with no trace: on 2026-11-10 an approved CLAUDE.md write reported
+    ``verified: true`` and was back to HEAD bytes a minute later. The silence is the bug,
+    so the write result carries ``durable: false`` plus this warning instead. Git-probe
+    failure stays fail-open (a warning, not a gate).
+    """
+    if _protected_instruction_reason(filepath, task_id) is None:
+        return None
+    import subprocess
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+        root = os.path.dirname(resolved)
+        while not os.path.exists(os.path.join(root, ".git")):
+            parent = os.path.dirname(root)
+            if parent == root:
+                return None  # not in a checkout: nothing pins it
+            root = parent
+        if os.path.isfile(os.path.join(root, ".git")):
+            return None  # linked worktree: its own branch, task-owned
+
+        def _git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(("git", "-C", root, *args), capture_output=True, text=True, timeout=5)
+
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        if branch not in _PINNED_CHECKOUT_BRANCHES:
+            return None
+        rel = os.path.relpath(resolved, root)
+        if _git("ls-files", "--error-unmatch", "--", rel).returncode != 0:
+            return None
+        if not _git("status", "--porcelain", "--", rel).stdout.strip():
+            return None  # already committed: durable
+    except Exception:
+        return None
+    return (f"NOT DURABLE: {resolved} is an uncommitted change in a shared {branch} checkout. "
+            "A pass that pins this checkout to origin/main (git reset --hard) discards it "
+            "silently, so do NOT treat this write as done — commit it through a PR, or make "
+            "the change in a worktree.")
+
+
+
 def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config`` can steer
     execution via ``ProxyCommand``). Routine gate: once/session/always, honors --yolo,

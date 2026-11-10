@@ -34,7 +34,8 @@ from tools.file_tools_paths import (
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
+    _is_internal_file_tool_content, _protected_write_durability_warning,
+    _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
     _check_not_found_cache, _known_full_content_sha256,
@@ -814,6 +815,17 @@ def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session
             file_state.note_write(task_id, path_to_resolved[p])
 
 
+def _flag_durability(result_dict: dict, paths: list[str], task_id: str) -> None:
+    """Post-success: a protected-instruction write that only lives in a pinned checkout is
+    reported as ``durable: false`` with the reason, so it is never carded as done."""
+    for p in paths:
+        warning = _protected_write_durability_warning(p, task_id)
+        if warning:
+            result_dict["durable"] = False
+            result_dict["_warning"] = " | ".join(filter(None, (result_dict.get("_warning"), warning)))
+            return
+
+
 # Whole-file rewrite hint: an overwrite of an existing file this large whose new content keeps at least
 # this fraction of the old lines is a patch written the expensive way. In one 1,393-agent run 661 such
 # rewrites of >20k-char files cost ~25M output chars (~$155) where `patch` averaged 1.3k chars/call.
@@ -918,6 +930,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     # same-task writes stay unblocked (patch_tool carries it).
                     _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
                 _note_edited(task_id, [path], path_to_resolved, session_id)
+                _flag_durability(result_dict, [path], task_id)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -1022,6 +1035,7 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
                 _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
+                _flag_durability(result_dict, _resolved_modified, task_id)
                 _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
                 # Clear failure counters so a future miss starts a fresh count.
                 _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
