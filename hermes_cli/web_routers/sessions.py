@@ -10,7 +10,9 @@ import asyncio
 import json
 import re
 import sqlite3
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -26,6 +28,7 @@ from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
 from hermes_cli.web_routers._common import (
     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
+    untitled_fallback,
 )
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
@@ -155,6 +158,51 @@ def _serving_profile(profile: Optional[str]) -> str:
     return _cron_profile_home(profile)[0] if profile else _cron_default_profile()
 
 
+# GET /api/sessions is the desktop's polled list path. Repeating an unchanged DB read used to
+# open that profile's store (12 GB on the programmer profile) on every poll; the fingerprint
+# below makes an unchanged store an LRU hit instead. The TTL bounds staleness on filesystems
+# whose mtime granularity hides a same-second write.
+_SESSIONS_CACHE_TTL_SECONDS = 5.0
+_SESSIONS_CACHE_MAX_ENTRIES = 64
+_SESSIONS_CACHE: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+_SESSIONS_CACHE_LOCK = threading.Lock()
+
+
+def _db_file_stamp(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _sessions_cache_key(db_path: Path, params: dict) -> tuple:
+    return (str(db_path), _db_file_stamp(db_path), _db_file_stamp(Path(f"{db_path}-wal")),
+            tuple(sorted(params.items())))
+
+
+def _sessions_cache_get(key: tuple) -> Optional[dict]:
+    now = time.monotonic()
+    with _SESSIONS_CACHE_LOCK:
+        item = _SESSIONS_CACHE.get(key)
+        if item is None:
+            return None
+        if now >= item[0]:
+            _SESSIONS_CACHE.pop(key, None)
+            return None
+        _SESSIONS_CACHE.move_to_end(key)
+        return item[1]
+
+
+def _sessions_cache_put(key: tuple, value: dict) -> dict:
+    with _SESSIONS_CACHE_LOCK:
+        _SESSIONS_CACHE[key] = (time.monotonic() + _SESSIONS_CACHE_TTL_SECONDS, value)
+        _SESSIONS_CACHE.move_to_end(key)
+        while len(_SESSIONS_CACHE) > _SESSIONS_CACHE_MAX_ENTRIES:
+            _SESSIONS_CACHE.popitem(last=False)
+    return value
+
+
 def _resolve_session_id(db, session_id: str) -> Optional[str]:
     """Resolve *session_id*; a corrupt store (prefix scan raises "malformed") is
     reported as 503 with the actual problem instead of a misleading 404."""
@@ -197,6 +245,13 @@ def get_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
     profile_name = _cron_profile_home(profile)[0] if profile else None
+    cache_key = _sessions_cache_key(_session_db_path_for_profile(profile), {
+        "limit": limit, "offset": offset, "min_messages": min_messages, "archived": archived,
+        "order": order, "source": source, "sources": sources, "exclude_sources": exclude_sources,
+        "cwd_prefix": cwd_prefix, "full": full, "profile": profile})
+    cached = _sessions_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -238,8 +293,9 @@ def get_sessions(
             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
             # ``{profile: "corrupt"}`` shape as the /api/profiles/sessions* lists.
             storage = {row_profile: STORAGE_CORRUPT} if storage_state(db.db_path) == STORAGE_CORRUPT else {}
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset,
-                    "storage": storage}
+            return _sessions_cache_put(cache_key, {
+                "sessions": untitled_fallback(sessions), "total": total, "limit": limit,
+                "offset": offset, "storage": storage, "updated_at": time.time()})
         finally:
             db.close()
     except HTTPException:
