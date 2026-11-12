@@ -12,6 +12,7 @@ import re
 import asyncio
 import os
 import sys
+import threading
 import time
 from fastapi import APIRouter
 from hermes_cli.web_deps import LateState, late
@@ -63,6 +64,10 @@ _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.
 
 
 _STATUS_ACTIVE_SESSIONS_TIMEOUT = 0.75
+_ACTIVE_SESSIONS_CACHE_TTL_SECONDS = 30.0
+_ACTIVE_SESSIONS_CACHE: dict[str, Any] = {"value": 0, "expires": 0.0}
+_ACTIVE_SESSIONS_LOCK = threading.Lock()
+_ACTIVE_SESSIONS_SCANNING = threading.Lock()
 _GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
 _HEALTHY_PLATFORM_STATES = {"connected", "running", "ok"}
 
@@ -94,16 +99,38 @@ def _count_status_active_sessions() -> int:
 
 
 async def _status_active_sessions() -> int:
+    """Best-effort count, cached and single-flight.
+
+    Each refresh opens the serving profile's state.db and lists sessions; on a 12 GB store a
+    cold page cache made that scan take 14 s while `asyncio.wait_for`'s timeout only abandons
+    the *future*, not the thread. Every desktop poll then stacked another runaway scan on the
+    worker pool until /api/health could no longer be answered inside its budget. One scan at a
+    time, reusing the last value, keeps the block bounded.
+    """
+    with _ACTIVE_SESSIONS_LOCK:
+        if time.monotonic() < _ACTIVE_SESSIONS_CACHE["expires"]:
+            return _ACTIVE_SESSIONS_CACHE["value"]
+    # A scan that outlived its timeout keeps running; a later poll must not start another.
+    if not _ACTIVE_SESSIONS_SCANNING.acquire(blocking=False):
+        with _ACTIVE_SESSIONS_LOCK:
+            return _ACTIVE_SESSIONS_CACHE["value"]
+    value = None
     try:
-        return await asyncio.wait_for(
+        value = await asyncio.wait_for(
             run_in_threadpool(_count_status_active_sessions),
             timeout=_STATUS_ACTIVE_SESSIONS_TIMEOUT)
     except TimeoutError:
-        _log.debug("/api/status active session count exceeded %.2fs; returning 0",
+        _log.debug("/api/status active session count exceeded %.2fs; keeping the last value",
                    _STATUS_ACTIVE_SESSIONS_TIMEOUT)
     except Exception as exc:
         _log.debug("/api/status active session count unavailable: %s", exc)
-    return 0
+    finally:
+        _ACTIVE_SESSIONS_SCANNING.release()
+    with _ACTIVE_SESSIONS_LOCK:
+        if value is not None:
+            _ACTIVE_SESSIONS_CACHE["value"] = value
+        _ACTIVE_SESSIONS_CACHE["expires"] = time.monotonic() + _ACTIVE_SESSIONS_CACHE_TTL_SECONDS
+        return _ACTIVE_SESSIONS_CACHE["value"]
 
 
 @router.get("/api/ssh/ownership")

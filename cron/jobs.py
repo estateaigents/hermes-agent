@@ -3350,13 +3350,22 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+def save_job_output(job_id: str, output: str, *, execution_id: Optional[str] = None):
+    """Save job output to file.
+
+    ``execution_id`` makes the name unique to that run: the timestamp stem is whole-second, so two
+    runs of one job inside the same second would otherwise overwrite each other and a stored
+    receipt path could silently resolve to the other run's document (#848).
+    """
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
     _ensure_cron_dir(job_output_dir)
     _secure_dir(job_output_dir)
-    output_file = job_output_dir / f"{_hermes_now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
+    stem = _hermes_now().strftime('%Y-%m-%d_%H-%M-%S')
+    # Timestamp prefix stays first: _prune_job_output orders filenames reverse-lexically.
+    if execution_id:
+        stem = f"{stem}__{execution_id}"
+    output_file = job_output_dir / f"{stem}.md"
     atomic_write_text(output_file, output, tmp_prefix=".output_", mode=0o600)
     _secure_file(output_file)
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).

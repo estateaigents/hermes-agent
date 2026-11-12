@@ -59,6 +59,17 @@ async def config_scoped_to_thread(profile: Optional[str], fn: Callable[[], Any])
     return await asyncio.to_thread(_run)
 
 
+def untitled_fallback(rows: list[dict]) -> list[dict]:
+    """Name a row created before its first prompt, so a live window is never an
+    unlabelled entry. Response-only: a title set later by the owner wins on the next read."""
+    for row in rows:
+        if not str(row.get("title") or "").strip():
+            started = row.get("started_at")
+            stamp = time.strftime("%H:%M", time.localtime(started)) if started else ""
+            row["title"] = f"Untitled · {stamp}" if stamp else "Untitled"
+    return rows
+
+
 def destructive_profile(profile: Optional[str], route: str) -> Optional[str]:
     """The profile a DESTRUCTIVE or PRIVILEGED route acts on, or 400 when it is ambiguous.
 

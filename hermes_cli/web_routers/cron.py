@@ -215,7 +215,8 @@ def _cron_output_run_timestamp(path: Path) -> Optional[float]:
     resolves the offset in effect on the filename's own date.
     """
     try:
-        naive = datetime.strptime(path.stem, _CRON_OUTPUT_FILENAME_FORMAT)
+        # Execution-unique stems carry a `__<execution_id>` suffix; strip it before parsing.
+        naive = datetime.strptime(re.sub(r"__[0-9a-f]{32}$", "", path.stem), _CRON_OUTPUT_FILENAME_FORMAT)
     except ValueError:
         return None
     tz = _get_timezone()
