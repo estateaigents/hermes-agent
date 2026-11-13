@@ -993,7 +993,7 @@ DEFAULT_CONFIG = {
         # estimate, not billing — only successful main-agent responses with a response.usage count;
         # auxiliary calls, retries, fallbacks and cache writes are missed, so the total can be
         # 10x-100x under the provider bill.
-        "show_token_analytics": False,
+        "show_token_analytics": True,
         # IPs / bounded CIDRs of reverse proxies trusted to supply X-Forwarded-Proto/-For. Loopback
         # always trusted; wildcards and /0 rejected (spoofing guard).
         "trusted_proxies": [],

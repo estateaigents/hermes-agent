@@ -55,9 +55,15 @@ def _lossy_text(value: Any) -> Any:
 
 def _row_get(row: Any, col: str, default: Any = None) -> Any:
     """``row[col]`` tolerant of the column being absent from the SELECT / schema."""
-    if row is None or col not in row.keys():
+    if row is None:
         return default
-    return row[col]
+    if hasattr(row, "keys"):
+        if col not in row.keys():
+            return default
+        return row[col]
+    if isinstance(row, dict):
+        return row.get(col, default)
+    return default
 
 
 def _json_or(value: Any, default: Any = None) -> Any:
@@ -3368,7 +3374,7 @@ def block_task(
         # (#117363). Classify in place; never re-type or flap status. A caller
         # asserting run ownership (``expected_run_id``) cannot own a parked
         # card -- its run is over -- so it is refused like any stale worker.
-        if cur_row["status"] == "blocked":
+        if _row_get(cur_row, "status") == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
             classified = conn.execute(
@@ -3383,7 +3389,7 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        source_status = _retry_status_for_run(conn, task_id) if _row_get(cur_row, "status") == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3400,6 +3406,19 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+
+        if reason and "acceptance-unsatisfiable" in reason:
+            body_row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            cur_body = (_row_get(body_row, "body") if body_row else "") or ""
+            if "## PA / GATE NOTE" not in cur_body:
+                clean_reason = reason.strip()
+                if clean_reason.startswith("acceptance-gate: "):
+                    clean_reason = clean_reason[len("acceptance-gate: "):]
+                if clean_reason.endswith(" — add a frozen ## ACCEPTANCE block (templates/card-acceptance-block.md), then unblock"):
+                    clean_reason = clean_reason[:-len(" — add a frozen ## ACCEPTANCE block (templates/card-acceptance-block.md), then unblock")]
+                new_body = cur_body + f"\n\n## PA / GATE NOTE\n{clean_reason}\n"
+                conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (new_body, task_id))
+
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3448,7 +3467,7 @@ def _route_block(
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+    if recurrences >= BLOCK_RECURRENCE_LIMIT and not (reason and "acceptance-unsatisfiable" in reason):
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
