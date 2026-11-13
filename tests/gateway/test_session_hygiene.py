@@ -1173,12 +1173,44 @@ def test_bound_model_input_without_hygiene_is_deterministic_and_fail_closed():
     assert bounded[0] is rows[0], "the leading system/setup row must survive"
     assert bounded[-1] is rows[-1], "the newest row must survive"
     assert bounded[1].get("role") != "tool", "the kept tail must not start on an orphan tool result"
+    assert not (
+        bounded[1].get("role") == "assistant" and bool(bounded[1].get("tool_calls"))
+    ), "the kept tail must not start on assistant(tool_calls)"
     assert rows[:] == snapshot, "the source transcript must not be mutated in place"
     # Same input, same cut — no randomness, no clock.
     assert bound_model_input_without_hygiene(rows, _HARD_LIMIT) == bounded
     # At or below the limit nothing is dropped, and the SAME list comes back.
     assert bound_model_input_without_hygiene(rows, len(rows)) is rows
     assert bound_model_input_without_hygiene(rows, len(rows) + 5) is rows
+
+    # Multi-step tool call cycle cut test: naive cut lands on assistant(tool_calls) or tool.
+    multistep = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    # Limit 7: naive cut lands at index 2 (assistant with tool_calls).
+    bounded_ms = bound_model_input_without_hygiene(multistep, 7)
+    assert bounded_ms[0]["role"] == "system"
+    assert bounded_ms[1]["role"] == "user"
+    assert bounded_ms[1]["content"] == "u1"
+
+    # Degenerate case where all turns after system are tool call cycle rows.
+    degenerate = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "function": {"name": "f"}}]},
+    ]
+    bounded_deg = bound_model_input_without_hygiene(degenerate, 2)
+    assert len(bounded_deg) == 2
+    assert bounded_deg[0]["role"] == "system"
+    assert bounded_deg[1] == degenerate[-1]
 
 
 @pytest.mark.asyncio

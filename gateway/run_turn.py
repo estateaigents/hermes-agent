@@ -130,10 +130,20 @@ def bound_model_input_without_hygiene(history: list[Any], limit: int) -> list[An
     # Always leave room for the newest row: a setup-only payload would answer nothing.
     head_end = min(head_end, limit - 1)
     tail_start = len(history) - (limit - head_end)
-    # Never start the kept tail on a tool result: its parent assistant(tool_calls) row is dropped
-    # with it, and an orphaned tool result is an invalid sequence for every provider.
-    while (tail_start < len(history) and isinstance(history[tail_start], dict)
-           and history[tail_start].get("role") == "tool"):
+    # Never start the kept tail on a tool result or assistant with tool_calls:
+    # an orphaned tool result or leading tool call turn without its preceding user/tool
+    # turn is an invalid sequence for provider APIs (e.g. Gemini HTTP 400).
+    while (
+        tail_start < len(history) - 1
+        and isinstance(history[tail_start], dict)
+        and (
+            history[tail_start].get("role") == "tool"
+            or (
+                history[tail_start].get("role") == "assistant"
+                and bool(history[tail_start].get("tool_calls"))
+            )
+        )
+    ):
         tail_start += 1
     return history[:head_end] + history[tail_start:]
 
