@@ -37,6 +37,12 @@ def create_surface(source: str) -> str:
 
 
 def session_source_for(platform: Optional[str]) -> str:
+    if platform == "subagent":
+        # A delegate_task child runs in the parent's process and so inherits its env label
+        # (HERMES_SESSION_SOURCE=desktop/kanban), but it is not that conversation: the reserve in
+        # tools/delegate_tool_child_run stamps `subagent`, and every listing/picker filter keys on it.
+        # Without this, the inherited label wins and the child shows up in the parent's Recents.
+        return "subagent"
     source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip()
     single_query = get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1"
     explicit = get_session_env("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1"

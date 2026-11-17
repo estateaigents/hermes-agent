@@ -49,6 +49,17 @@ def test_oneshot_marker_does_not_relabel_subagents(monkeypatch):
     assert session_source_for("subagent") == "subagent"
 
 
+@pytest.mark.parametrize("inherited", ["desktop", "tui", "kanban"])
+def test_delegated_child_is_not_labelled_with_the_parents_source(monkeypatch, inherited):
+    """A delegate_task child runs in the parent's process and inherits its session env, so the parent's
+    transport/automation label must not become the child's `source`: desktop-spawned children were
+    persisted `desktop` and flooded the desktop sidebar's Recents (subagent_listing_scope only filters
+    `source='subagent'`)."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", inherited)
+
+    assert session_source_for("subagent") == "subagent"
+
+
 @pytest.mark.parametrize("inherited", ["kanban", "tool", "a2a"])
 def test_oneshot_child_keeps_inherited_automation_source(monkeypatch, inherited):
     monkeypatch.setenv("HERMES_SESSION_SOURCE", inherited)
